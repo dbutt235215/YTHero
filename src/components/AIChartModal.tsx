@@ -87,6 +87,8 @@ export const AIChartModal: React.FC<AIChartModalProps> = ({
           genre: track.genre || 'Electronic',
           tempo: track.tempo,
           key: track.key || 'C',
+          timeSignature: track.timeSignature || 4,
+          danceability: track.danceability,
           difficulty,
           focusStyle: selectedStyle,
           customPrompt: customPrompt.trim() || undefined,

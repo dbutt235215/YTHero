@@ -125,13 +125,19 @@ export default function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ urlOrId: trimmed }),
-          signal: AbortSignal.timeout(12000),
+          // This endpoint now does real work (oEmbed fetch + a GetSongBPM
+          // lookup), each with their own short internal timeouts, but no
+          // LLM call — 15s is a comfortable margin above their worst case.
+          signal: AbortSignal.timeout(15000),
         });
 
         if (res.ok) {
           const imported: Playlist = await res.json();
           if (imported && imported.tracks && imported.tracks.length > 0) {
-            // Ensure first track has AI chart attached (default: MELODY)
+            // Ensure first track has AI chart attached (default: MELODY).
+            // This is a separate request from the parse above, on purpose —
+            // it's the slow one (real LLM call), so it must never be allowed
+            // to block or time out the fast metadata response.
             if (!imported.tracks[0].aiChart) {
               try {
                 const chartRes = await fetch('/api/chart/ai-generate', {
@@ -143,9 +149,15 @@ export default function App() {
                     genre: imported.tracks[0].genre || 'Electronic',
                     tempo: imported.tracks[0].tempo,
                     key: imported.tracks[0].key || 'C',
+                    timeSignature: imported.tracks[0].timeSignature || 4,
+                    danceability: imported.tracks[0].danceability,
                     difficulty,
                     focusStyle: 'MELODY',
                   }),
+                  // Bounded so a slow/unresponsive Gemini call can't hang the
+                  // import flow indefinitely — the game is fully playable on
+                  // the procedural/curated fallback chart if this times out.
+                  signal: AbortSignal.timeout(25000),
                 });
                 if (chartRes.ok) {
                   const chartData = await chartRes.json();

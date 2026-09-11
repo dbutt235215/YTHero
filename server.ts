@@ -411,19 +411,84 @@ function generateFallbackAIBlueprint(
 }
 
 /**
+ * Playability floor: two notes in the SAME lane closer together than this are
+ * effectively unhittable as separate hits (they'll register as one or force a
+ * miss). Used both to tell the model what's off-limits and to enforce it
+ * afterward, since structured-output models still drift on numeric spacing.
+ */
+const MIN_SAME_LANE_GAP_SECONDS = 0.12;
+
+interface AIChartContext {
+  trackTitle: string;
+  artist: string;
+  genre?: string;
+  genres?: string[];
+  tempo?: number;
+  key?: string;
+  timeSignature?: number;
+  danceability?: number; // 0-1
+  difficulty?: string;
+  focusStyle?: string;
+  customPrompt?: string;
+}
+
+/**
+ * Removes/clamps anything the model returned that would be unplayable or
+ * out-of-schema-bounds, regardless of what the prompt asked for. Structured
+ * output guarantees valid JSON shape, not valid game design — this is the
+ * safety net for the latter.
+ */
+function sanitizeAIBlueprint(parsed: any, tempo: number): any {
+  const beatDuration = 60 / (tempo > 40 && tempo < 240 ? tempo : 120);
+  const minGapBeats = MIN_SAME_LANE_GAP_SECONDS / beatDuration;
+
+  const sectionMotifs = (parsed.sectionMotifs || []).map((section: any) => {
+    const measures = (Array.isArray(section.measures) ? section.measures : []).map((measure: any) => {
+      const steps = (Array.isArray(measure) ? measure : [])
+        .map((s: any) => ({
+          beat: Math.max(0, Math.min(3.9, Number(s?.beat) || 0)),
+          lane: Math.max(0, Math.min(3, Math.round(Number(s?.lane) || 0))),
+          accent: Boolean(s?.accent),
+        }))
+        .sort((a: any, b: any) => a.beat - b.beat);
+
+      // Drop same-lane notes packed tighter than MIN_SAME_LANE_GAP_SECONDS
+      const lastBeatByLane: Record<number, number> = {};
+      const filtered = steps.filter((s: any) => {
+        const last = lastBeatByLane[s.lane];
+        if (last !== undefined && s.beat - last < minGapBeats) return false;
+        lastBeatByLane[s.lane] = s.beat;
+        return true;
+      });
+
+      return filtered.length > 0 ? filtered : steps.slice(0, 1);
+    });
+
+    return { ...section, measures };
+  });
+
+  return { ...parsed, sectionMotifs };
+}
+
+/**
  * Primary AI Chart Generator Engine
  * Defaults to Gemini AI models with automatic fallback to procedural synthesis if offline
  */
-async function generateAIChart(
-  trackTitle: string,
-  artist: string,
-  genre: string = 'Electronic',
-  tempo: number = 120,
-  key: string = 'C',
-  difficulty: string = 'MEDIUM',
-  focusStyle: string = 'MELODY',
-  customPrompt?: string
-): Promise<{ blueprint: any; aiPowered: boolean; modelUsed?: string }> {
+async function generateAIChart(ctx: AIChartContext): Promise<{ blueprint: any; aiPowered: boolean; modelUsed?: string }> {
+  const {
+    trackTitle,
+    artist,
+    genre = 'Electronic',
+    genres = [],
+    tempo = 120,
+    key = 'C',
+    timeSignature = 4,
+    danceability,
+    difficulty = 'MEDIUM',
+    focusStyle = 'MELODY',
+    customPrompt,
+  } = ctx;
+
   const ai = getGeminiClient();
 
   if (ai) {
@@ -436,36 +501,61 @@ async function generateAIChart(
 
     const styleInstruction = styleDescriptions[focusStyle] || styleDescriptions.MELODY;
 
+    // Ground note-count guidance in the ACTUAL tempo instead of asking for a
+    // flat density regardless of song speed — a 90 BPM ballad and a 174 BPM
+    // DnB track should not produce the same note count per measure.
+    const beatDuration = 60 / (tempo > 40 && tempo < 240 ? tempo : 120);
+    const minGapBeats = Math.round((MIN_SAME_LANE_GAP_SECONDS / beatDuration) * 100) / 100;
+    const speedTier = tempo < 100 ? 'slow' : tempo < 135 ? 'moderate' : tempo < 165 ? 'fast' : 'very fast';
+    const genreList = genres.length > 0 ? genres.join(', ') : genre;
+    const feelDescriptor =
+      danceability !== undefined
+        ? danceability > 0.66
+          ? 'highly danceable/rhythmic — favor steady, groove-driven note spacing'
+          : danceability > 0.33
+          ? 'moderately rhythmic'
+          : 'less rhythmic/more atmospheric — favor sparser, held-note phrasing over dense runs'
+        : undefined;
+
     const prompt = `Song Title: "${trackTitle}" by ${artist}
-Genre: ${genre}
-Tempo: ${tempo} BPM
+Genre(s): ${genreList}
+Tempo: ${tempo} BPM (${speedTier} — one beat = ${beatDuration.toFixed(3)}s)
+Time Signature: ${timeSignature}/4
 Musical Key: ${key}
+${feelDescriptor ? `Feel: ${feelDescriptor}` : ''}
 Player Difficulty Target: ${difficulty}
 Charting Style Focus: ${focusStyle} (${styleInstruction})
-${customPrompt ? `User Custom Directives: "${customPrompt}"` : ''}
+${customPrompt ? `User Custom Directives (creative flavor only — do not violate the playability rules below): "${customPrompt}"` : ''}
 
-Generate a musically coherent 4-lane rhythm game chart structure with melodic note phrases for the 5 song sections: INTRO, VERSE, BUILD, CHORUS, SOLO.
+Generate a musically coherent 4-lane rhythm game chart for the 5 song sections: INTRO, VERSE, BUILD, CHORUS, SOLO.
 Each section must provide 4 measures (a 4-bar phrase), with musical note placement (beat 0.0 to 3.75).
+The 4 measures within a section must be musically distinct from each other (call / repeat-with-variation / development / turnaround) — do not repeat an identical measure 4 times.
+
+PLAYABILITY RULES (hard constraints — a musically great chart that breaks these is still a bad chart):
+- Never place two notes in the SAME lane less than ${minGapBeats} beats apart at this tempo — that's physically unhittable as two separate notes.
+- At "${speedTier}" tempo, keep same-instant chords (multiple lanes on the exact same beat) rare and reserve them for the biggest accents only.
+- Match note density to suggestedDensity: LIGHT ≈ 4-6 notes/measure, MODERATE ≈ 7-10 notes/measure, DENSE ≈ 11-16 notes/measure. Do not exceed DENSE even in SOLO.
+
 Lane mappings:
 0: Low / Root melody / Bass
 1: Mid-low vocal body / Rhythm riff
 2: Mid-high lead hook / Chorus vocal
 3: Soaring peak melody / Sax solo / High octave accent`;
 
-    const systemInstruction = `You are an expert rhythm game chart architect (specializing in osu!mania, Guitar Hero, Beatmania, and StepMania).
+    const systemInstruction = `You are an expert rhythm game chart architect (specializing in osu!mania, Guitar Hero, Beatmania, and StepMania), designing for real human hands and real reaction-time limits — not just plausible-looking JSON.
 Return a JSON object containing:
 - styleName: A creative, evocative name for this AI chart (e.g., "Neon Saxophone Odyssey", "Syncopated Cyber Groove")
 - musicalSummary: A concise 2-sentence explanation of the rhythmic motifs and melodic flow you designed for this track
-- suggestedDensity: "LIGHT", "MODERATE", or "DENSE"
+- suggestedDensity: "LIGHT", "MODERATE", or "DENSE" — choose this honestly based on the tempo and feel given, then make the actual note counts match it
 - sectionMotifs: array of 5 objects for sections: INTRO, VERSE, BUILD, CHORUS, SOLO.
   Each section object has:
   - section: ("INTRO" | "VERSE" | "BUILD" | "CHORUS" | "SOLO")
-  - measures: array of 4 measures (each measure is an array of steps).
+  - measures: array of 4 measures (each measure is an array of steps), each measure musically distinct from the others in the section.
     Each step has:
     - beat: number between 0.0 and 3.75 (use quarter/eighth note increments like 0, 0.5, 1.0, 1.5, 2.0, 2.5, 2.75, 3.0, 3.5)
     - lane: integer 0, 1, 2, or 3
-    - accent: boolean (true on peak musical moments or chord accents)
-Follow musicality: build tension in BUILD, explode in CHORUS with expressive melody, keep INTRO atmospheric, and provide technical flair in SOLO.`;
+    - accent: boolean (true on peak musical moments or chord accents — use sparingly, only for genuine high points)
+Follow musicality: build tension in BUILD, explode in CHORUS with expressive melody, keep INTRO atmospheric, and provide technical flair in SOLO — but the PLAYABILITY RULES in the prompt override musical ambition whenever they conflict.`;
 
     const responseSchema = {
       type: Type.OBJECT,
@@ -508,7 +598,10 @@ Follow musicality: build tension in BUILD, explode in CHORUS with expressive mel
       required: ['styleName', 'musicalSummary', 'sectionMotifs', 'suggestedDensity'],
     };
 
-    const modelsToTry = ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+    // Stable, non-experimental models first — gemini-flash-latest points at
+    // whatever's currently experimental and carries tighter rate limits, so
+    // it's a last resort rather than the primary path.
+    const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
     for (const modelName of modelsToTry) {
       // Allow up to 2 attempts per model with a small backoff for temporary spikes
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -536,7 +629,7 @@ Follow musicality: build tension in BUILD, explode in CHORUS with expressive mel
                 aiPowered: true,
                 modelUsed: modelName,
                 blueprint: {
-                  ...parsed,
+                  ...sanitizeAIBlueprint(parsed, tempo),
                   generatedAt: new Date().toISOString(),
                   focusStyle,
                 },
@@ -667,17 +760,14 @@ async function startServer() {
         const genre = features?.genres?.[0] || 'Imported Track';
         const tempoSource: 'verified' | 'estimated' = features ? 'verified' : 'estimated';
 
-        // Pre-generate default Melodic Virtuoso AI chart for this imported track,
-        // now grounded in a real tempo/key/genre when one was found.
-        const aiChartResult = await generateAIChart(
-          title,
-          author,
-          genre,
-          tempo,
-          key,
-          'MEDIUM',
-          'MELODY'
-        );
+        // NOTE: AI chart generation is intentionally NOT done here. It's slow
+        // (up to ~70s worst case across model/retry attempts) and the client
+        // only allows 12s for this endpoint before it aborts and falls back
+        // to a bare-bones parser. The client (App.tsx) already generates the
+        // AI chart as a separate, non-blocking follow-up request once this
+        // fast metadata response comes back — see handleImportPlaylist().
+        // Tracks play immediately using the curated/procedural chart
+        // generator as a fallback until the AI chart arrives.
 
         const ytTrack = {
           id: `yt-${videoId}`,
@@ -696,7 +786,6 @@ async function startServer() {
           genre,
           key,
           tempoSource,
-          aiChart: aiChartResult.blueprint,
         };
 
         const result = {
@@ -786,23 +875,29 @@ async function startServer() {
         trackTitle = 'Track',
         artist = 'Artist',
         genre = 'Electronic',
+        genres = [],
         tempo = 120,
         key = 'C',
+        timeSignature = 4,
+        danceability,
         difficulty = 'MEDIUM',
         focusStyle = 'MELODY',
         customPrompt = '',
       } = req.body;
 
-      const result = await generateAIChart(
+      const result = await generateAIChart({
         trackTitle,
         artist,
         genre,
-        Number(tempo) || 120,
+        genres,
+        tempo: Number(tempo) || 120,
         key,
+        timeSignature: Number(timeSignature) || 4,
+        danceability: danceability !== undefined ? Number(danceability) : undefined,
         difficulty,
         focusStyle,
-        customPrompt
-      );
+        customPrompt,
+      });
 
       res.json({
         success: true,
