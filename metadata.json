@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Hero",
+  "description": "A Guitar Hero-style rhythm game powered by YouTube Music, featuring real-time tempo beat-matching, melody-driven rhythm charts, and global leaderboards.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
