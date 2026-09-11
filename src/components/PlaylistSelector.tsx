@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Play, Sparkles, Flame, Gauge, Link2, Music2, ExternalLink, Loader2, Trophy, Clock, Zap, Radio, Bot } from 'lucide-react';
+import { Play, Sparkles, Flame, Gauge, Link2, Music2, ExternalLink, Loader2, Trophy, Clock, Zap, Radio, Bot, CheckCircle2 } from 'lucide-react';
 import { AIChartBlueprint, GameDifficulty, Playlist, Track } from '../types';
 import { AIChartModal } from './AIChartModal';
 
@@ -380,12 +380,21 @@ export const PlaylistSelector: React.FC<PlaylistSelectorProps> = ({
                   {/* Middle: Audio Metrics (BPM, Energy, Duration) */}
                   <div className="flex items-center gap-3 sm:gap-4 ml-8 sm:ml-0 flex-wrap">
                     <span
-                      className={`px-2.5 py-1 rounded-md border font-mono text-xs font-bold ${getTempoBadgeColor(
+                      className={`px-2.5 py-1 rounded-md border font-mono text-xs font-bold inline-flex items-center gap-1 ${getTempoBadgeColor(
                         track.tempo
                       )}`}
-                      title="Track Tempo (Beats Per Minute)"
+                      title={
+                        track.tempoSource === 'verified'
+                          ? 'Real tempo, matched via GetSongBPM.com'
+                          : 'Estimated tempo (no verified match found for this track)'
+                      }
                     >
                       {track.tempo} BPM
+                      {track.tempoSource === 'verified' ? (
+                        <CheckCircle2 className="w-3 h-3 opacity-80" />
+                      ) : track.tempoSource === 'estimated' ? (
+                        <span className="opacity-60">~</span>
+                      ) : null}
                     </span>
 
                     <div className="flex items-center gap-1.5 text-xs text-zinc-400 font-mono" title="Energy Level">
@@ -440,6 +449,18 @@ export const PlaylistSelector: React.FC<PlaylistSelectorProps> = ({
               );
             })}
           </div>
+
+          <p className="text-center text-[10px] text-zinc-600 mt-4">
+            Verified tempo &amp; key data via{' '}
+            <a
+              href="https://getsongbpm.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-zinc-500 hover:text-zinc-400 underline"
+            >
+              GetSongBPM.com
+            </a>
+          </p>
         </div>
       )}
 

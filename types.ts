@@ -20,6 +20,9 @@ export interface Track {
   genre?: string;
   beatOffset?: number; // offset in seconds to the first drum downbeat
   aiChart?: AIChartBlueprint;
+  /** Where tempo/key came from: a real lookup match, or a deterministic guess. */
+  tempoSource?: 'verified' | 'estimated';
+  timeSignatureRaw?: string; // e.g. "4/4" as returned by the lookup provider
 }
 
 export interface AIMelodicStep {

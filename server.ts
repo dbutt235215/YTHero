@@ -29,6 +29,123 @@ if (!fs.existsSync(DATA_DIR)) {
 // In-memory cache for YouTube video searches
 const youtubeSearchCache = new Map<string, { videoId: string; title?: string }>();
 
+// ---------------------------------------------------------------------------
+// Real audio-feature lookups (GetSongBPM.com)
+//
+// Replaces the old "hash the video ID into a fake BPM" approach with an
+// actual tempo/key/time-signature lookup against a real song database.
+// Free tier: 3000 requests/hour per key. A backlink to getsongbpm.com is
+// required by their terms of service (see PlaylistSelector.tsx credit link).
+// Sign up for a key at https://getsongbpm.com/api and set GETSONGBPM_API_KEY.
+// ---------------------------------------------------------------------------
+const GETSONGBPM_BASE_URL = 'https://api.getsong.co';
+const GETSONGBPM_API_KEY = process.env.GETSONGBPM_API_KEY;
+
+interface AudioFeatureMatch {
+  tempo: number;
+  timeSignature: number;
+  timeSignatureRaw: string;
+  keyOf: string;
+  danceability: number; // 0-1 normalized
+  acousticness: number; // 0-1 normalized
+  matchedTitle: string;
+  matchedArtist: string;
+  genres: string[];
+}
+
+// Cache lookups by normalized "artist|title" so repeat plays and shared
+// tracks don't burn the hourly quota.
+const audioFeatureCache = new Map<string, AudioFeatureMatch | null>();
+
+/**
+ * YouTube video titles are messy ("Artist - Song (Official Video) [HD]",
+ * "Song (Lyrics) ft. Someone", "Artist - Song | Official Audio", channel
+ * names ending in " - Topic", etc). This strips the common noise and, where
+ * possible, splits out an artist/title guess so the BPM lookup has a much
+ * better chance of matching the real song in the database.
+ */
+function cleanYouTubeMetadata(rawTitle: string, rawAuthor: string): { title: string; artist: string } {
+  let title = rawTitle;
+
+  // Strip bracketed/parenthetical noise: (Official Video), [Lyrics], (HD), etc.
+  title = title.replace(/[\(\[][^\)\]]*(official|video|audio|lyrics?|hd|4k|visualizer|remaster\w*|hq|explicit|clean)[^\)\]]*[\)\]]/gi, '');
+  // Strip trailing "| Official ..." style suffixes
+  title = title.replace(/\s*\|.*$/, '');
+  // Strip featuring credits, they rarely help a title match
+  title = title.replace(/\s*(feat\.?|ft\.?)\s+.+$/i, '');
+
+  let artist = rawAuthor.replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim();
+
+  // Many uploads are titled "Artist - Song Title"; prefer that over the
+  // channel name when it's present, since channel names are often labels
+  // or aggregator accounts rather than the performing artist.
+  const dashSplit = title.split(/\s+[-–—]\s+/);
+  if (dashSplit.length >= 2) {
+    artist = dashSplit[0].trim() || artist;
+    title = dashSplit.slice(1).join(' - ').trim();
+  }
+
+  title = title.replace(/\s{2,}/g, ' ').trim();
+  artist = artist.replace(/\s{2,}/g, ' ').trim();
+
+  return { title: title || rawTitle, artist: artist || rawAuthor };
+}
+
+/**
+ * Looks up real tempo/key/time-signature for a song from GetSongBPM.
+ * Returns null (never throws) if the key is missing, the lookup times out,
+ * or no confident match is found — callers fall back to estimation.
+ */
+async function lookupAudioFeatures(title: string, artist: string): Promise<AudioFeatureMatch | null> {
+  if (!GETSONGBPM_API_KEY) return null;
+
+  const cacheKey = `${artist.toLowerCase()}|${title.toLowerCase()}`;
+  if (audioFeatureCache.has(cacheKey)) {
+    return audioFeatureCache.get(cacheKey)!;
+  }
+
+  try {
+    const lookup = `song:${title} artist:${artist}`;
+    const url = `${GETSONGBPM_BASE_URL}/search/?type=both&limit=1&lookup=${encodeURIComponent(lookup)}&api_key=${encodeURIComponent(GETSONGBPM_API_KEY)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+
+    if (!res.ok) {
+      audioFeatureCache.set(cacheKey, null);
+      return null;
+    }
+
+    const data = (await res.json()) as any;
+    const match = Array.isArray(data?.search) ? data.search[0] : null;
+
+    if (!match || !match.tempo) {
+      audioFeatureCache.set(cacheKey, null);
+      return null;
+    }
+
+    const timeSigRaw: string = match.time_sig || '4/4';
+    const timeSigNumerator = parseInt(timeSigRaw.split('/')[0], 10) || 4;
+
+    const result: AudioFeatureMatch = {
+      tempo: Math.round(Number(match.tempo)),
+      timeSignature: timeSigNumerator,
+      timeSignatureRaw: timeSigRaw,
+      keyOf: match.key_of || 'C',
+      danceability: Math.max(0, Math.min(100, Number(match.danceability) || 50)) / 100,
+      acousticness: Math.max(0, Math.min(100, Number(match.acousticness) || 0)) / 100,
+      matchedTitle: match.title || title,
+      matchedArtist: match.artist?.name || artist,
+      genres: Array.isArray(match.artist?.genres) ? match.artist.genres : [],
+    };
+
+    audioFeatureCache.set(cacheKey, result);
+    return result;
+  } catch {
+    // Network error or timeout — treat as "no match", never block the request
+    audioFeatureCache.set(cacheKey, null);
+    return null;
+  }
+}
+
 // Pre-populated verified working YouTube video IDs for instant resolution
 const KNOWN_TRACK_VIDEOS: Record<string, string> = {
   'the midnight sunset': 'URma_gu1aNE',
@@ -530,21 +647,34 @@ async function startServer() {
           // Timeout or error, proceed with standard defaults
         }
 
-        // Determine tempo deterministically based on videoId
+        // Deterministic fallback hash, used only if no real lookup match is found
         let hash = 0;
         for (let i = 0; i < videoId.length; i++) {
           hash = (hash * 31 + videoId.charCodeAt(i)) % 10000;
         }
         const bpmList = [114, 120, 124, 126, 128, 130, 132, 140, 150, 174, 88, 92, 96, 105];
-        const tempo = bpmList[hash % bpmList.length];
 
-        // Pre-generate default Melodic Virtuoso AI chart for this imported track
+        // Try to resolve REAL tempo/key/time-signature from a song database
+        // using a cleaned-up guess of the artist/title from the YouTube metadata.
+        const { title: cleanTitle, artist: cleanArtist } = cleanYouTubeMetadata(title, author);
+        const features = await lookupAudioFeatures(cleanTitle, cleanArtist);
+
+        const tempo = features?.tempo ?? bpmList[hash % bpmList.length];
+        const key = features?.keyOf ?? ['C', 'D', 'E', 'F', 'G', 'A'][hash % 6];
+        const timeSignature = features?.timeSignature ?? 4;
+        const danceability = features ? features.danceability : 0.8;
+        const energy = features ? Math.max(0, Math.min(1, 1 - features.acousticness * 0.6)) : 0.85;
+        const genre = features?.genres?.[0] || 'Imported Track';
+        const tempoSource: 'verified' | 'estimated' = features ? 'verified' : 'estimated';
+
+        // Pre-generate default Melodic Virtuoso AI chart for this imported track,
+        // now grounded in a real tempo/key/genre when one was found.
         const aiChartResult = await generateAIChart(
           title,
           author,
-          'Imported Track',
+          genre,
           tempo,
-          ['C', 'D', 'E', 'F', 'G', 'A'][hash % 6],
+          key,
           'MEDIUM',
           'MELODY'
         );
@@ -556,14 +686,16 @@ async function startServer() {
           album: 'YouTube Music',
           albumArt: thumbnail,
           tempo,
-          timeSignature: 4,
-          energy: 0.85,
-          danceability: 0.8,
+          timeSignature,
+          timeSignatureRaw: features?.timeSignatureRaw,
+          energy,
+          danceability,
           durationMs: 80000,
           youtubeVideoId: videoId,
           sourceType: 'YOUTUBE' as const,
-          genre: 'Imported Track',
-          key: ['C', 'D', 'E', 'F', 'G', 'A'][hash % 6],
+          genre,
+          key,
+          tempoSource,
           aiChart: aiChartResult.blueprint,
         };
 
